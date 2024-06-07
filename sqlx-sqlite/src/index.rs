@@ -65,7 +65,7 @@ impl SQLiteIndex {
                 ColumnStatistics::Table,
                 SeaQExpr::col((FileStatistics::Table, FileStatistics::FileId)).equals((ColumnStatistics::Table, ColumnStatistics::FileId)),
             )
-            .and_where_option(filter.map(|f| push_down_filter(&f)).flatten())
+            .and_where_option(filter.and_then(|f| push_down_filter(&f)))
             .build_sqlx(SqliteQueryBuilder);
 
         // TODO: we could aggregate the row groups into an array in the query to transmit less data over the wire
@@ -191,8 +191,8 @@ impl SQLiteIndex {
                     arrow::datatypes::DataType::Int64 => {
                         let min_values = min_values.as_primitive::<Int64Type>();
                         let max_values = max_values.as_primitive::<Int64Type>();
-                        let min = min_values.value(row_group) as i64;
-                        let max = max_values.value(row_group) as i64;
+                        let min = min_values.value(row_group);
+                        let max = max_values.value(row_group);
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
@@ -221,7 +221,7 @@ impl SQLiteIndex {
             file_name: file_name.to_string(),
             file_size_bytes: file_size as i64,
             row_group_count: metadata.num_row_groups() as i64,
-            row_count: metadata.file_metadata().num_rows() as i64,
+            row_count: metadata.file_metadata().num_rows(),
         };
 
         self.add_row(file_statistics, column_statistics).await?;
@@ -447,11 +447,7 @@ pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
                     // This is something we can push down!
                     let column_name = column.name;
                     let filter = push_down_binary_filter(&value, &binary_expr.op);
-                    if let Some(filter) = filter {
-                        Some(SeaQExpr::col(ColumnStatistics::ColumnName).eq(column_name).and(filter))
-                    } else {
-                        None
-                    }
+                    filter.map(|filter| SeaQExpr::col(ColumnStatistics::ColumnName).eq(column_name).and(filter))
                 }
                 (left, right) => {
                     let left_pushdown = push_down_filter(&left);
@@ -476,13 +472,8 @@ pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
             }
         },
         Expr::Not(inner) => {
-            let inner_pushdown = push_down_filter(&*inner);
-            match inner_pushdown {
-                Some(inner_pushdown) => {
-                    Some(inner_pushdown.not())
-                },
-                None => None
-            }
+            let inner_pushdown = push_down_filter(inner);
+            inner_pushdown.map(|inner_pushdown| inner_pushdown.not())
         },
         // We could handle more cases here, at least simple ones involving nulls, negations, etc.
         // But this example does not implement that
