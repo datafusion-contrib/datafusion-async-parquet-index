@@ -31,6 +31,28 @@ use sea_query_binder::SqlxBinder;
 /// you could store the entire `id` column in the secondary index as a key/value map from `id` to
 /// (file_name, row_group, row_number) and use that to enable fast point lookups on parquet files.
 /// This is not implemented in this example.
+/// 
+/// The index is implemented as a SQLite database with two tables:
+/// - `file_statistics` with columns `file_id`, `file_name`, `file_size_bytes`, `row_group_count`, `row_count`
+/// - `column_statistics` with columns `file_id`, `column_name`, `row_group`, `null_count`, `row_count`,
+///    and min/max values for each data type we support
+/// 
+/// Here is roughly what `SELECT * FROM file_statistics` would look like:
+/// | file_id | file_name     | file_size_bytes | row_group_count | row_count |
+/// | 1       | file1.parquet | 1234            | 3               | 1000      |
+/// 
+/// And `SELECT * FROM column_statistics`:
+/// | file_id | column_name | row_group | null_count | row_count | int_min_value | int_max_value | string_min_value | string_max_value |
+/// |---------|-------------|-----------|------------|-----------|---------------|---------------|------------------|------------------|
+/// | 1       | column1     | 0         | 0          | 1000      | 1             | 100           |                  |                  |
+/// | 1       | column1     | 1         | 0          | 1000      | 101           | 200           |                  |                  |
+/// | 1       | column1     | 2         | 0          | 1000      | 201           | 300           |                  |                  |
+/// | 1       | column2     | 0         | 0          | 1000      |               |               | a                | c                |
+/// | 1       | column2     | 1         | 0          | 1000      |               |               | c                | x                |
+/// | 1       | column2     | 2         | 0          | 1000      |               |               | x                | z                |
+/// 
+/// While we use SQLite in this example, the index could be implemented with other databases or system.
+/// SQLite is just a convenient example that is also very similar to other RDBMS systems that you might use.
 #[derive(Debug)]
 pub struct SQLiteIndex {
     pool: SqlitePool,
@@ -48,9 +70,16 @@ impl SQLiteIndex {
         Self { pool }
     }
 
-    /// Return all the files matching the predicate
-    ///
-    /// Returns a tuple `(file_name, file_size)`
+    /// Return the filenames / row groups that match the filter
+    /// 
+    /// This function pushes down the filter to the index to get a list of row groups that match
+    /// and hence the files that need to be read.
+    /// 
+    /// The filter is pushed down to the index by converting it to a set of SQL expressions
+    /// that can be evaluated by the index.
+    /// 
+    /// The return value is a list of `(file_name, FileScanPlan)` tuples where `FileScanPlan` contains
+    /// the file metadata and the row groups that need to be scanned.
     pub async fn get_files(&self, filter: Option<Expr>) -> Result<Vec<(String, FileScanPlan)>> {
         let (sql, values) = Query::select()
             .columns(vec![
@@ -74,6 +103,7 @@ impl SQLiteIndex {
         let row_groups: Vec<(String, i64, i64, i64)> = sqlx::query_as_with(&sql, values)
             .fetch_all(&self.pool)
             .await.unwrap(); // TODO: handle error, possibly failing gracefully by scanning all files?
+
         
         let mut file_scans: HashMap<String, (i64, ParquetAccessPlan)> = HashMap::new(); // file_name -> (file_size, row_groups)
 
@@ -82,7 +112,7 @@ impl SQLiteIndex {
             // Here we could do finer grained row-level filtering, but this example does not implement that
             access_plan.set(row_group_to_scan as usize, RowGroupAccess::Scan)
         }
-        
+
         Ok(
             file_scans.into_iter().map(|(file_name, (file_size, access_plan))| {
                 (
@@ -452,9 +482,9 @@ pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
                 (left, right) => {
                     let left_pushdown = push_down_filter(&left);
                     let right_pushdown = push_down_filter(&right);
-                    match (left_pushdown, right_pushdown) {
-                        (Some(left_pushdown), Some(right_pushdown)) => {
-                            match binary_expr.op {
+                    match (left_pushdown, right_pushdown, binary_expr.op) {
+                        (Some(left_pushdown), Some(right_pushdown), op) => {
+                            match op {
                                 Operator::And => {
                                     Some(left_pushdown.and(right_pushdown))
                                 },
@@ -466,6 +496,11 @@ pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
                                 }
                             }
                         }
+                        // If we have A AND B but we can't push down B we can still push down A
+                        // because A must be true for the whole expression to be true
+                        (Some(left_pushdown), None, Operator::And) => Some(left_pushdown),
+                        // Same for the other side
+                        (None, Some(right_pushdown), Operator::And) => Some(right_pushdown),
                         _ => None
                     }
                 }
@@ -474,6 +509,44 @@ pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
         Expr::Not(inner) => {
             let inner_pushdown = push_down_filter(inner);
             inner_pushdown.map(|inner_pushdown| inner_pushdown.not())
+        },
+        Expr::Like(inner) => {
+            let negated = inner.negated;
+            let expr = *inner.expr.clone();
+            let pattern = *inner.pattern.clone();
+            let escape_char = inner.escape_char;
+            let case_insensitive = inner.case_insensitive;
+
+            let column = match &expr {
+                Expr::Column(column) => column.clone(),
+                _ => return None
+            };
+            let pattern = match &pattern {
+                Expr::Literal(ScalarValue::Utf8(Some(pattern))) => pattern.clone(),
+                _ => return None
+            };
+            // We don't support escape characters in this example
+            if escape_char.is_some() {
+                return None;
+            }
+            // Find the prefix in pattern by looking for the first `%` and truncate
+            let prefix_len = pattern.chars().position(|c| c == '%').unwrap_or_else(|| pattern.len());
+            let mut prefix = pattern.chars().take(prefix_len).collect::<String>();
+            let mut min_val_col = SeaQExpr::col(ColumnStatistics::StringMinValue);
+            // If this is a case insensitive match we need to convert the prefix to lowercase
+            if case_insensitive {
+                prefix = prefix.to_lowercase();
+                min_val_col = SeaQExpr::expr(sea_query::Func::lower(min_val_col));
+            };
+
+            let filter = SeaQExpr::col(ColumnStatistics::ColumnName).eq(column.name).and(
+                min_val_col.gte(SqlValue::String(Some(Box::new(prefix.clone()))))
+            );
+            if negated {
+                Some(filter.not())
+            } else {
+                Some(filter)
+            }
         },
         // We could handle more cases here, at least simple ones involving nulls, negations, etc.
         // But this example does not implement that
@@ -559,8 +632,19 @@ fn push_down_binary_filter(value: &ScalarValue, op: &Operator) -> Option<SimpleE
         Operator::LtEq => {
             min_col.lte(sql_value)
         },
-        // In theory we could handle LIKE for the limited but common case of a prefix match
-        // and maybe other operators, but this example does not implement that
+        Operator::LikeMatch => {
+            // Find a prefix in the LIKE pattern and use it to filter
+            match sql_value {
+                SqlValue::String(Some(pattern)) => {
+                    let mut prefix = pattern.clone();
+                    let prefix_len = prefix.chars().position(|c| c == '%').unwrap_or_else(|| prefix.len());
+                    prefix.truncate(prefix_len);
+                    min_col.lte(SqlValue::String(Some(prefix.clone()))).and(max_col.gte(SqlValue::String(Some(prefix))))
+                },
+                _ => return None
+            }
+        },
+        // In theory we could handle other operators, but this example does not implement that
         _ => return None
     };
     Some(expr)

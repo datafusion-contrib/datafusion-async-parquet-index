@@ -27,10 +27,10 @@ use crate::index::SQLiteIndex;
 mod index;
 
 /// This example demonstrates building a secondary index over multiple Parquet
-/// files and using that index during query to skip ("prune") files that do not
-/// contain relevant data.
+/// files and using that index during query to skip ("prune") files and row groups
+/// that do not contain relevant data.
 ///
-/// This example rules out relevant data using min/max values of a column
+/// This example rules out irrelevant data using min/max values of a column
 /// extracted from the Parquet metadata. In a real system, the index could be
 /// more sophisticated, e.g. using inverted indices, bloom filters or other
 /// techniques.
@@ -41,9 +41,6 @@ mod index;
 /// [`ListingTable`], which also do file pruning based on parquet statistics
 /// (using the same underlying APIs)
 ///
-/// For a more advanced example of using an index to prune row groups within a
-/// file, see the (forthcoming) `advanced_parquet_index` example.
-///
 /// # Diagram
 ///
 /// ```text
@@ -53,27 +50,39 @@ mod index;
 ///  step 1: predicate is   ┌ ─ ─ ─ ─▶┃ (sometimes referred to ┃
 ///  evaluated against                ┃ as a "catalog" or      ┃
 ///  data in the index      │         ┃ "metastore")           ┃
-///  (using                           ┗━━━━━━━━━━━━━━━━━━━━━━━━┛
-///  PruningPredicate)      │                      │
+///                                   ┗━━━━━━━━━━━━━━━━━━━━━━━━┛
+///                         │                      │
 ///
 ///                         │                      │
 /// ┌──────────────┐
 /// │  value = 150 │─ ─ ─ ─ ┘                      │
 /// └──────────────┘                                   ┌─────────────┐
 ///  Predicate from query                          │   │             │
+///                                                    │  skip file  │
+///                                                │   │             │
 ///                                                    └─────────────┘
 ///                                                │   ┌─────────────┐
-///                   step 2: Index returns only    ─ ▶│             │
-///                   parquet files that might have    └─────────────┘
-///                   matching data.                         ...
+///                   step 2: Index returns only       │  ┌────────┐ │
+///                   parquet files that might     │   │  │ scan   │ │
+///                   have matching data.              │  │ rg 0   │ │
+///                                                │   │  └────────┘ │
+///                                                    │  ┌────────┐ │
+///                                                │   │  │ scan   │ │
+///                                                ─ ▶ │  │ rg 3   │ │
+///                   The index can choose to          │  └────────┘ │
+///                   scan entire files,               │     ...     │
+///                   only some row-groups within      │  ┌────────┐ │
+///                   each file, or even               │  │  scan  │ │
+///                   individual rows within each      │  │  rg n  │ │
+///                   row group (not shown in this)    │  └────────┘ │
+///                   example                          └─────────────┘
+///                                                          ...
 ///                                                    ┌─────────────┐
-///                   Thus some parquet files are      │             │
-///                   "pruned" and thus are not        └─────────────┘
-///                   scanned at all                   Parquet Files
-///
+///                                                    │             │
+///                                                    └─────────────┘
+///                                                     Parquet Files
 /// ```
 ///
-/// [`ListingTable`]: datafusion::datasource::listing::ListingTable
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // We use an in-memory SQLite database to store the index for this example
@@ -135,6 +144,14 @@ async fn main() -> anyhow::Result<()> {
     .await?
     .show()
     .await?;
+    println!("Files scanned: {:?}\n", provider.last_execution());
+
+    // it's even possible to get LIKE pushed down to the index
+    println!("** Select data, predicate `text LIKE 'text2%0'`");
+    ctx.sql("SELECT file_name, count(text) FROM index_table WHERE text LIKE 'text2%0' GROUP BY file_name")
+        .await?
+        .show()
+        .await?;
     println!("Files scanned: {:?}\n", provider.last_execution());
 
     Ok(())
@@ -311,6 +328,7 @@ impl DemoData {
 ///
 /// * file_name: Utf8
 /// * value: Int32
+/// * text: Utf8
 fn make_demo_file(path: impl AsRef<Path>, value_range: Range<i32>) -> Result<()> {
     let path = path.as_ref();
     let file = File::create(path)?;
@@ -322,10 +340,15 @@ fn make_demo_file(path: impl AsRef<Path>, value_range: Range<i32>) -> Result<()>
 
     let num_values = value_range.len();
     let file_names = StringArray::from_iter_values(std::iter::repeat(&filename).take(num_values));
-    let values = Int32Array::from_iter_values(value_range);
+    let values = Int32Array::from_iter_values(value_range.clone());
+    let texts: StringArray = value_range
+        .map(|i| format!("text{}", i))
+        .collect::<Vec<_>>()
+        .into();
     let batch = RecordBatch::try_from_iter(vec![
         ("file_name", Arc::new(file_names) as ArrayRef),
         ("value", Arc::new(values) as ArrayRef),
+        ("text", Arc::new(texts) as ArrayRef),
     ])?;
 
     let schema = batch.schema();
