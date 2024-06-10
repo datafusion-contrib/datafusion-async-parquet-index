@@ -2,8 +2,8 @@ use std::{
     any::Any, cell::RefCell, fmt::Display, fs::{self, DirEntry, File}, ops::Range, path::{Path, PathBuf}, sync::{Arc, Mutex}
 };
 
-use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use arrow_schema::SchemaRef;
+use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     datasource::{
@@ -67,7 +67,7 @@ mod index;
 ///                   have matching data.              │  │ rg 0   │ │
 ///                                                │   │  └────────┘ │
 ///                                                    │  ┌────────┐ │
-///                                                │   │  │ scan   │ │
+///                                                │   │  │ skip   │ │
 ///                                                ─ ▶ │  │ rg 3   │ │
 ///                   The index can choose to          │  └────────┘ │
 ///                   scan entire files,               │     ...     │
@@ -100,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     let data = DemoData::try_new()?;
 
     // Create a table provider with and  our special index.
-    let index = SQLiteIndex::new(pool);
+    let index = SQLiteIndex::new(pool.clone());
     let provider = Arc::new(IndexTableProvider::try_new(data.path(), index).await?);
     println!("** Table Provider:");
     println!("{provider}\n");
@@ -153,6 +153,8 @@ async fn main() -> anyhow::Result<()> {
         .show()
         .await?;
     println!("Files scanned: {:?}\n", provider.last_execution());
+
+    pool.close().await;
 
     Ok(())
 }

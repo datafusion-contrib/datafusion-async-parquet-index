@@ -5,21 +5,18 @@ edition = "2021"
 
 [dependencies]
 anyhow = "~1"
-arrow = "51.0.0"
-async-trait = "0.1.80"
-datafusion = { features = ["backtrace"], git = "https://github.com/adriangb/datafusion.git" }
-datafusion-expr = { git = "https://github.com/adriangb/datafusion.git" }
-datafusion-optimizer = { git = "https://github.com/adriangb/datafusion.git" }
-datafusion-common = { git = "https://github.com/adriangb/datafusion.git" }
-datafusion-physical-expr = { git = "https://github.com/adriangb/datafusion.git" }
-datafusion-sql = { git = "https://github.com/adriangb/datafusion.git" }
-sqlx = { version = "~0", features = [ "runtime-tokio", "tls-native-tls", "sqlite", "json", "uuid", "chrono", "macros" ] }
-tempfile = "3.10.1"
-thiserror = "~1"
-tokio = { version = "~1", features = [ "rt-multi-thread", "macros" ] }
-url = "2.5.0"
-arrow-schema = "51.0.0"
-object_store = { version = "0.9.1", features = ["gcp", "http"] }
-time = "0.3.36"
-sea-query = { version = "0", features = ["with-chrono", "backend-sqlite", "hashable-value", "with-json", "with-chrono", "derive", "attr", "thread-safe"] }
-sea-query-binder = { version = "0", features = ["sqlx-sqlite", "with-json", "with-chrono", ] }
+async-trait = "0"
+datafusion = { features = ["backtrace"], git = "https://github.com/apache/datafusion.git" }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git" }
+datafusion-common = { git = "https://github.com/apache/datafusion.git" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git" }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git" }
+sqlx = { version = "~0", features = [ "runtime-tokio", "sqlite" ] }
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = [ "rt-multi-thread", "macros" ] }
+url = "2"
+object_store = { version = "0" }
+sea-query = { version = "0", features = ["backend-sqlite", "hashable-value", "derive", "thread-safe"] }
+sea-query-binder = { version = "0", features = ["sqlx-sqlite" ] }

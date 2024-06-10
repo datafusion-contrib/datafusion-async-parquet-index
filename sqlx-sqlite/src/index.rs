@@ -2,15 +2,11 @@ use std::{
     collections::HashMap, fmt::Display, fs::File, path::Path
 };
 
-use arrow::{
-    array::AsArray,
-    datatypes::{Int16Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type},
-};
+use datafusion::arrow::datatypes::{Int16Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type};
 use datafusion::{
-    datasource::physical_plan::parquet::{ParquetAccessPlan, RequestedStatistics, RowGroupAccess, StatisticsConverter},
-    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
-    prelude::*,
+    datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess, StatisticsConverter}, parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder, prelude::*
 };
+use datafusion::arrow::array::AsArray;
 use datafusion_common::{internal_datafusion_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::Operator;
 use sqlx::SqlitePool;
@@ -144,22 +140,19 @@ impl SQLiteIndex {
 
         // extract the parquet statistics from the file's footer
         let metadata = reader.metadata();
-
+        let schema = reader.schema();
+        let parquet_schema = reader.parquet_schema();
+        let row_groups = metadata.row_groups();
+        let row_counts = StatisticsConverter::row_group_row_counts(row_groups.iter())?;
         let mut column_statistics: Vec<ColumnStatisticsInsert> = Vec::with_capacity(reader.schema().fields().len() * metadata.num_row_groups());
 
         for column in 0..reader.schema().fields().len() {
-            let column_name = reader.schema().field(column).name().clone();
-    
-            let row_counts = StatisticsConverter::row_counts(reader.metadata())?;
-            let null_counts_array = StatisticsConverter::try_new(&column_name, RequestedStatistics::NullCount, reader.schema())?.extract(reader.metadata())?;
-            let null_counts = null_counts_array.as_primitive::<UInt64Type>();
-
-            let min_values =
-                StatisticsConverter::try_new(&column_name.clone(), RequestedStatistics::Min, reader.schema())?
-                    .extract(reader.metadata())?;
-            let max_values =
-                StatisticsConverter::try_new(&column_name.clone(), RequestedStatistics::Max, reader.schema())?
-                    .extract(reader.metadata())?;
+            let column_name = schema.field(column).name().clone();
+            let converter = StatisticsConverter::try_new(&column_name, schema, parquet_schema)?;
+            let min_values = converter.row_group_mins(row_groups.iter())?;
+            let max_values = converter.row_group_maxes(row_groups.iter())?;
+            let null_counts = converter.row_group_null_counts(row_groups.iter())?;
+            let null_counts = null_counts.as_primitive::<UInt64Type>();
 
             for row_group in 0..reader.metadata().num_row_groups() {
                 let stats = ColumnStatisticsInsertBuilder::new(
@@ -170,7 +163,7 @@ impl SQLiteIndex {
                 );
                 // match on the data type of the column, downcast the array and extract the min/max values and build the statistics
                 match reader.schema().field(column).data_type() {
-                    arrow::datatypes::DataType::Int8 => {
+                    datafusion::arrow::datatypes::DataType::Int8 => {
                         let min_values = min_values.as_primitive::<Int32Type>();
                         let max_values = max_values.as_primitive::<Int32Type>();
                         let min = min_values.value(row_group) as i64;
@@ -178,7 +171,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::UInt8 => {
+                    datafusion::arrow::datatypes::DataType::UInt8 => {
                         let min_values = min_values.as_primitive::<UInt16Type>();
                         let max_values = max_values.as_primitive::<UInt16Type>();
                         let min = min_values.value(row_group) as i64;
@@ -186,7 +179,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::Int16 => {
+                    datafusion::arrow::datatypes::DataType::Int16 => {
                         let min_values = min_values.as_primitive::<Int16Type>();
                         let max_values = max_values.as_primitive::<Int16Type>();
                         let min = min_values.value(row_group) as i64;
@@ -194,7 +187,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::UInt16 => {
+                    datafusion::arrow::datatypes::DataType::UInt16 => {
                         let min_values = min_values.as_primitive::<UInt16Type>();
                         let max_values = max_values.as_primitive::<UInt16Type>();
                         let min = min_values.value(row_group) as i64;
@@ -202,7 +195,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::Int32 => {
+                    datafusion::arrow::datatypes::DataType::Int32 => {
                         let min_values = min_values.as_primitive::<Int32Type>();
                         let max_values = max_values.as_primitive::<Int32Type>();
                         let min = min_values.value(row_group) as i64;
@@ -210,7 +203,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::UInt32 => {
+                    datafusion::arrow::datatypes::DataType::UInt32 => {
                         let min_values = min_values.as_primitive::<UInt32Type>();
                         let max_values = max_values.as_primitive::<UInt32Type>();
                         let min = min_values.value(row_group) as i64;
@@ -218,7 +211,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::Int64 => {
+                    datafusion::arrow::datatypes::DataType::Int64 => {
                         let min_values = min_values.as_primitive::<Int64Type>();
                         let max_values = max_values.as_primitive::<Int64Type>();
                         let min = min_values.value(row_group);
@@ -226,7 +219,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::Int(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::Utf8 => {
+                    datafusion::arrow::datatypes::DataType::Utf8 => {
                         let min_values = min_values.as_string::<i32>();
                         let max_values = max_values.as_string::<i32>();
                         let min = min_values.value(row_group).to_string();
@@ -234,7 +227,7 @@ impl SQLiteIndex {
                         let stats = stats.build(MinMaxStats::String(min, max));
                         column_statistics.push(stats);
                     }
-                    arrow::datatypes::DataType::LargeUtf8 => {
+                    datafusion::arrow::datatypes::DataType::LargeUtf8 => {
                         let min_values = min_values.as_string::<i64>();
                         let max_values = max_values.as_string::<i64>();
                         let min = min_values.value(row_group).to_string();
@@ -382,7 +375,6 @@ impl SQLiteIndex {
         Ok(())
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct FileScanPlan {
