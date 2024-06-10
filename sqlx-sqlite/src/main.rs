@@ -146,14 +146,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     println!("Files scanned: {:?}\n", provider.last_execution());
 
-    // it's even possible to get LIKE pushed down to the index
-    println!("** Select data, predicate `text LIKE 'text2%0'`");
-    ctx.sql("SELECT file_name, count(text) FROM index_table WHERE text LIKE 'text2%0' GROUP BY file_name")
-        .await?
-        .show()
-        .await?;
-    println!("Files scanned: {:?}\n", provider.last_execution());
-
     pool.close().await;
 
     Ok(())

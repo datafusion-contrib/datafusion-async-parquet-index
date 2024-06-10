@@ -502,46 +502,8 @@ pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
             let inner_pushdown = push_down_filter(inner);
             inner_pushdown.map(|inner_pushdown| inner_pushdown.not())
         },
-        Expr::Like(inner) => {
-            let negated = inner.negated;
-            let expr = *inner.expr.clone();
-            let pattern = *inner.pattern.clone();
-            let escape_char = inner.escape_char;
-            let case_insensitive = inner.case_insensitive;
-
-            let column = match &expr {
-                Expr::Column(column) => column.clone(),
-                _ => return None
-            };
-            let pattern = match &pattern {
-                Expr::Literal(ScalarValue::Utf8(Some(pattern))) => pattern.clone(),
-                _ => return None
-            };
-            // We don't support escape characters in this example
-            if escape_char.is_some() {
-                return None;
-            }
-            // Find the prefix in pattern by looking for the first `%` and truncate
-            let prefix_len = pattern.chars().position(|c| c == '%').unwrap_or_else(|| pattern.len());
-            let mut prefix = pattern.chars().take(prefix_len).collect::<String>();
-            let mut min_val_col = SeaQExpr::col(ColumnStatistics::StringMinValue);
-            // If this is a case insensitive match we need to convert the prefix to lowercase
-            if case_insensitive {
-                prefix = prefix.to_lowercase();
-                min_val_col = SeaQExpr::expr(sea_query::Func::lower(min_val_col));
-            };
-
-            let filter = SeaQExpr::col(ColumnStatistics::ColumnName).eq(column.name).and(
-                min_val_col.gte(SqlValue::String(Some(Box::new(prefix.clone()))))
-            );
-            if negated {
-                Some(filter.not())
-            } else {
-                Some(filter)
-            }
-        },
-        // We could handle more cases here, at least simple ones involving nulls, negations, etc.
-        // But this example does not implement that
+        // We could handle more cases here, e.g. `LIKE`, `IN`, etc.
+        // But this example does not implement those to keep complexity under control
         _ => None
     }
 }
