@@ -157,21 +157,21 @@ impl SQLiteIndex {
 
         let (sql, values) = query.build_sqlx(SqliteQueryBuilder);
 
-        let row_groups: Vec<(String, i64, i64, i64)> = sqlx::query_as_with(&sql, values)
+        let row_groups: Vec<RowGroupToScan> = sqlx::query_as_with(&sql, values)
             .fetch_all(&self.pool)
             .await
             .unwrap(); // TODO: handle error, possibly failing gracefully by scanning all files?
 
         let mut file_scans: HashMap<String, FileScanPlan> = HashMap::new(); // file_name -> (file_size, row_groups)
 
-        for (file_name, file_size, file_row_group_counts, row_group_to_scan) in row_groups {
-            let file_scan_plan = file_scans.entry(file_name.clone()).or_insert(
+        for row_group in row_groups {
+            let file_scan_plan = file_scans.entry(row_group.file_name.clone()).or_insert(
                 FileScanPlan {
-                    file_size: file_size as u64,
-                    access_plan: ParquetAccessPlan::new_none(file_row_group_counts as usize),
+                    file_size: row_group.file_size_bytes as u64,
+                    access_plan: ParquetAccessPlan::new_none(row_group.row_group_count as usize),
                 }
             );
-            file_scan_plan.access_plan.set(row_group_to_scan as usize, RowGroupAccess::Scan);
+            file_scan_plan.access_plan.set(row_group.row_group as usize, RowGroupAccess::Scan);
         }
 
         Ok(file_scans.into_iter().map(|(file_name, file_scan_plan)| (file_name, file_scan_plan)).collect())
@@ -574,4 +574,12 @@ struct FileStatisticsInsert {
     file_size_bytes: i64,
     row_group_count: i64,
     row_count: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RowGroupToScan {
+    pub file_name: String,
+    pub file_size_bytes: i64,
+    pub row_group_count: i64,
+    pub row_group: i64,
 }
