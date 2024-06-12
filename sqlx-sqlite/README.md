@@ -24,18 +24,18 @@ SQLiteIndex()
 +---------------+-------+
 | file_name     | value |
 +---------------+-------+
-| file2.parquet | 100   |
-| file2.parquet | 101   |
-| file2.parquet | 102   |
-| file2.parquet | 103   |
-| file2.parquet | 104   |
-| file2.parquet | 105   |
-| file2.parquet | 106   |
-| file2.parquet | 107   |
-| file2.parquet | 108   |
-| file2.parquet | 109   |
+| file1.parquet | 0     |
+| file1.parquet | 1     |
+| file1.parquet | 2     |
+| file1.parquet | 3     |
+| file1.parquet | 4     |
+| file1.parquet | 5     |
+| file1.parquet | 6     |
+| file1.parquet | 7     |
+| file1.parquet | 8     |
+| file1.parquet | 9     |
 +---------------+-------+
-Files scanned: [("file2.parquet", ParquetAccessPlan { row_groups: [Scan, Scan] }), ("file1.parquet", ParquetAccessPlan { row_groups: [Scan, Scan] }), ("file3.parquet", ParquetAccessPlan { row_groups: [Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan] })]
+Files scanned: [("file1.parquet", ParquetAccessPlan { row_groups: [Scan, Scan] }), ("file2.parquet", ParquetAccessPlan { row_groups: [Scan, Scan] }), ("file3.parquet", ParquetAccessPlan { row_groups: [Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan] })]
 
 ** Select data, predicate `value = 150`
 +---------------+-------+
@@ -53,6 +53,21 @@ Files scanned: [("file2.parquet", ParquetAccessPlan { row_groups: [Skip, Scan] }
 | file3.parquet | 2499                     |
 +---------------+--------------------------+
 Files scanned: [("file1.parquet", ParquetAccessPlan { row_groups: [Scan, Skip] }), ("file3.parquet", ParquetAccessPlan { row_groups: [Skip, Skip, Skip, Skip, Skip, Skip, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan, Scan] })]
+
+** Select data, predicate `value < 20 AND text = 'a'`
++---------------+--------------------------+
+| file_name     | COUNT(index_table.value) |
++---------------+--------------------------+
+| file1.parquet | 1                        |
++---------------+--------------------------+
+Files scanned: [("file1.parquet", ParquetAccessPlan { row_groups: [Scan, Skip] })]
+
+** Select data, predicate `value > 500 AND text = 'a'`
++-----------+--------------------------+
+| file_name | COUNT(index_table.value) |
++-----------+--------------------------+
++-----------+--------------------------+
+Files scanned: []
 ```
 
 As you can see the index is being used to select which row groups to read from the Parquet files.
