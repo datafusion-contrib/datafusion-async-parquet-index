@@ -108,8 +108,10 @@ impl SQLiteIndex {
         // This transforms e.g. `a = 5` to `a_min <= 5 AND a_max >= 5`
         let pruning = PruningPredicate::try_new(filter, schema.clone())?;
         let predicate = pruning.predicate_expr().clone();
-        // Replace any `{col}_row_count` with `row_count` as we don't store per-column row counts
-        // (they're the same for all columns in a row group)
+        // PruningPredicate references the row count of each column as `{col}_row_count`
+        // But we don't store per-column row counts in the index, we store them a single time for the row group
+        // since the row count is the same for all columns in a row group.
+        // Thus we replace any references to `{col}_row_count` with `row_count` in the predicate.
         let predicate = predicate.transform(|expr| {
             if let Some(column) = expr.as_any().downcast_ref::<phys_expr::Column>() {
                 if column.name().ends_with("_row_count") {
