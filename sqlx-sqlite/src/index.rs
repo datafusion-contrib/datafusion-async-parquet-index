@@ -38,8 +38,8 @@ use crate::rewrite::physical_expr_to_sea_query;
 ///
 /// The index is implemented as a SQLite database with two tables:
 /// - `file_statistics` with columns `file_id`, `file_name`, `file_size_bytes`, `row_group_count`, `row_count`
-/// - `column_statistics` with columns `file_id`, `column_name`, `row_group`, `null_count`, `row_count`,
-///    and min/max values for each data type we support
+/// - `row_group_statistics` with columns `file_id`, `row_group`, `row_count`,
+///    and min/max values for each column that is indexed.
 ///
 /// Here is roughly what `SELECT * FROM file_statistics` would look like:
 /// | file_id | file_name     | file_size_bytes | row_group_count | row_count |
