@@ -45,36 +45,27 @@ use crate::rewrite::physical_expr_to_sea_query;
 /// | file_id | file_name     | file_size_bytes | row_group_count | row_count |
 /// | 1       | file1.parquet | 1234            | 3               | 1000      |
 ///
-/// And `SELECT * FROM column_statistics`:
-/// | file_id | column_name | row_group | null_count | row_count | int_min_value | int_max_value | string_min_value | string_max_value |
-/// |---------|-------------|-----------|------------|-----------|---------------|---------------|------------------|------------------|
-/// | 1       | column1     | 0         | 0          | 1000      | 1             | 100           |                  |                  |
-/// | 1       | column1     | 1         | 0          | 1000      | 101           | 200           |                  |                  |
-/// | 1       | column1     | 2         | 0          | 1000      | 201           | 300           |                  |                  |
-/// | 1       | column2     | 0         | 0          | 1000      |               |               | a                | c                |
-/// | 1       | column2     | 1         | 0          | 1000      |               |               | c                | x                |
-/// | 1       | column2     | 2         | 0          | 1000      |               |               | x                | z                |
+/// And `SELECT * FROM row_group_statistics`:
+/// | file_id | row_group | row_count | column1_null_count | column1_min | column1_max | column2_null_count | column2_min | column2_max |
+/// | 1       | 0         | 100       | 0                  | 1           | 100         | 0                  | "a"         | "z"         |
+/// | 1       | 1         | 100       | 0                  | 101         | 200         | 0                  | "a"         | "z"         |
+/// | 1       | 2         | 100       | 0                  | 201         | 300         | 0                  | "a"         | "z"         |
+/// | 2       | 0         | 50        | 0                  | 1           | 100         | 0                  | "x"         | "x"         |
+/// | 2       | 1         | 100       | 0                  | 101         | 200         | 0                  | "y"         | "z"         |
+/// | 2       | 2         | 150       | 0                  | 201         | 300         | 0                  | "123"       | "456"       |
 ///
-/// To do filtering on `column_statistics` we need to self-join the table on `file_id` and `row_group` for each column:
-///
+/// To do filtering we rewrite the filter expression to a set of SQL expressions that can be evaluated against the index.
+/// For example, if we have a filter `a = 5` we would rewrite that to `a_min <= 5 AND a_max >= 5`:
+/// 
 /// ```sql
-/// WITH column1_stats AS (
-///   SELECT file_id, row_group, int_min_value AS column1_min, int_max_value AS column1_max FROM column_statistics WHERE column_name = 'column1'
-/// ), column2_stats AS (
-///  SELECT file_id, row_group, string_min_value AS column2_min, string_max_value AS column2_max FROM column_statistics WHERE column_name = 'column2'
+/// WITH row_groups AS (
+///   SELECT file_id, row_group
+///   FROM row_group_statistics
+///   WHERE a_min <= 5 AND a_max >= 5
 /// )
-/// SELECT *
-/// FROM column1_stats
-/// JOIN column2_stats USING (file_id, row_group)
-/// ```
-///
-/// Then to prune files we apply the filter to the joined table, let's call it `wide_column_statistics`:
-///
-/// ```sql
-/// SELECT file_name, file_size_bytes, row_group_count, row_group
-/// FROM wide_column_statistics
-/// JOIN file_statistics USING (file_id)
-/// WHERE column1_min <= 10 AND column1_max >= 10 AND column2_min <= 'b' AND column2_max >= 'b'
+/// SELECT file_name, file_size_bytes, row_group
+/// FROM file_statistics
+/// JOIN row_groups USING (file_id)
 /// ```
 ///
 /// While we use SQLite in this example, the index could be implemented with other databases or system.
