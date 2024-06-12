@@ -2,7 +2,7 @@ use std::{
     any::Any, cell::RefCell, fmt::Display, fs::{self, DirEntry, File}, ops::Range, path::{Path, PathBuf}, sync::{Arc, Mutex}
 };
 
-use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use datafusion::arrow::{array::{ArrayRef, Int32Array, RecordBatch, StringArray}, datatypes::{DataType, Field, Schema}};
 use datafusion::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -100,7 +100,18 @@ async fn main() -> anyhow::Result<()> {
     let data = DemoData::try_new()?;
 
     // Create a table provider with and  our special index.
-    let index = SQLiteIndex::new(pool.clone());
+    let index = SQLiteIndex::new(
+        pool.clone(),
+        Arc::new(
+            Schema::new(
+                vec![
+                    Field::new("file_name", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, false),
+                    Field::new("text", DataType::Utf8, false),
+                ]
+            )
+        )
+    );
     let provider = Arc::new(IndexTableProvider::try_new(data.path(), index).await?);
     println!("** Table Provider:");
     println!("{provider}\n");
@@ -225,11 +236,17 @@ impl TableProvider for IndexTableProvider {
 
         // convert filters like [`a = 1`, `b = 2`] to a single filter like `a = 1 AND b = 2`
         let predicate = conjunction(filters.to_vec());
+        let predicate = predicate
+            .map(|predicate| state.create_physical_expr(predicate, &df_schema))
+            .transpose()?
+            // if there are no filters, use a literal true to have a predicate
+            // that always evaluates to true we can pass to the index
+            .unwrap_or_else(|| datafusion_physical_expr::expressions::lit(true));
 
         // Use the index to find the files that might have data that matches the
         // predicate. Any file that can not have data that matches the predicate
         // will not be returned.
-        let files = self.index.get_files(predicate.clone()).await?;
+        let files = self.index.get_files(predicate.clone(), self.schema()).await?;
 
         // Record the last execution for debugging
         self.last_execution.lock().unwrap().get_mut().record(files.iter().map(|(filename, plan)| (filename.clone(), plan.access_plan.clone())).collect());
@@ -251,13 +268,6 @@ impl TableProvider for IndexTableProvider {
                 ).with_extensions(Arc::new(file_scan_plan.access_plan))
             );
         }
-
-        let predicate = predicate
-            .map(|predicate| state.create_physical_expr(predicate, &df_schema))
-            .transpose()?
-            // if there are no filters, use a literal true to have a predicate
-            // that always evaluates to true we can pass to the index
-            .unwrap_or_else(|| datafusion_physical_expr::expressions::lit(true));
 
         let exec = ParquetExec::builder(file_scan_config)
             .with_predicate(predicate)

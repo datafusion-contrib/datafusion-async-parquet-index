@@ -1,42 +1,50 @@
-use std::{
-    collections::HashMap, fmt::Display, fs::File, path::Path
-};
+use std::{collections::HashMap, fmt::Display, fs::File, path::Path, sync::Arc};
 
-use datafusion::arrow::datatypes::{Int16Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type};
-use datafusion::{
-    datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess, StatisticsConverter}, parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder, prelude::*
-};
 use datafusion::arrow::array::AsArray;
-use datafusion_common::{internal_datafusion_err, DataFusionError, Result, ScalarValue};
-use datafusion_expr::Operator;
-use sqlx::SqlitePool;
-use sea_query::{Expr as SeaQExpr, Iden, OnConflict, Query, SimpleExpr, SqliteQueryBuilder, Value as SqlValue};
+use datafusion::arrow::datatypes::{
+    Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef, UInt16Type, UInt32Type, UInt64Type,
+    UInt8Type,
+};
+use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::{
+    datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess, StatisticsConverter},
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+};
+use datafusion_common::{internal_datafusion_err, DataFusionError, Result};
+use datafusion_expr::{col, lit};
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_sql::unparser::expr_to_sql;
+use sea_query::{
+    Alias, Expr as SeaQExpr, OnConflict, Query, SimpleExpr,
+    SqliteQueryBuilder,
+};
 use sea_query_binder::SqlxBinder;
+use sqlx::SqlitePool;
 
 /// SQLite secondary index for a set of parquet files
 ///
 /// It stores file-level data (filename and file size) as well as statistics for each column
 /// in each row group of each file.
-/// 
+///
 /// When we scan a table we push down filters to the index to get a list of row groups that match
 /// and hence the files that need to be read.
-/// 
+///
 /// It is possible for the index to store finer grained statistics or a complete row oriented index
 /// that filters down to individual rows within row groups.
 /// For example, if you have a table with an `id` column and you want to enable fast point lookups
 /// you could store the entire `id` column in the secondary index as a key/value map from `id` to
 /// (file_name, row_group, row_number) and use that to enable fast point lookups on parquet files.
 /// This is not implemented in this example.
-/// 
+///
 /// The index is implemented as a SQLite database with two tables:
 /// - `file_statistics` with columns `file_id`, `file_name`, `file_size_bytes`, `row_group_count`, `row_count`
 /// - `column_statistics` with columns `file_id`, `column_name`, `row_group`, `null_count`, `row_count`,
 ///    and min/max values for each data type we support
-/// 
+///
 /// Here is roughly what `SELECT * FROM file_statistics` would look like:
 /// | file_id | file_name     | file_size_bytes | row_group_count | row_count |
 /// | 1       | file1.parquet | 1234            | 3               | 1000      |
-/// 
+///
 /// And `SELECT * FROM column_statistics`:
 /// | file_id | column_name | row_group | null_count | row_count | int_min_value | int_max_value | string_min_value | string_max_value |
 /// |---------|-------------|-----------|------------|-----------|---------------|---------------|------------------|------------------|
@@ -46,12 +54,36 @@ use sea_query_binder::SqlxBinder;
 /// | 1       | column2     | 0         | 0          | 1000      |               |               | a                | c                |
 /// | 1       | column2     | 1         | 0          | 1000      |               |               | c                | x                |
 /// | 1       | column2     | 2         | 0          | 1000      |               |               | x                | z                |
-/// 
+///
+/// To do filtering on `column_statistics` we need to self-join the table on `file_id` and `row_group` for each column:
+///
+/// ```sql
+/// WITH column1_stats AS (
+///   SELECT file_id, row_group, int_min_value AS column1_min, int_max_value AS column1_max FROM column_statistics WHERE column_name = 'column1'
+/// ), column2_stats AS (
+///  SELECT file_id, row_group, string_min_value AS column2_min, string_max_value AS column2_max FROM column_statistics WHERE column_name = 'column2'
+/// )
+/// SELECT *
+/// FROM column1_stats
+/// JOIN column2_stats USING (file_id, row_group)
+/// ```
+///
+/// Then to prune files we apply the filter to the joined table, let's call it `wide_column_statistics`:
+///
+/// ```sql
+/// SELECT file_name, file_size_bytes, row_group_count, row_group
+/// FROM wide_column_statistics
+/// JOIN file_statistics USING (file_id)
+/// WHERE column1_min <= 10 AND column1_max >= 10 AND column2_min <= 'b' AND column2_max >= 'b'
+/// ```
+///
 /// While we use SQLite in this example, the index could be implemented with other databases or system.
 /// SQLite is just a convenient example that is also very similar to other RDBMS systems that you might use.
 #[derive(Debug)]
 pub struct SQLiteIndex {
     pool: SqlitePool,
+    /// The index for the schema. Not all columns in the table need to be indexed.
+    schema: SchemaRef,
 }
 
 impl Display for SQLiteIndex {
@@ -62,65 +94,79 @@ impl Display for SQLiteIndex {
 }
 
 impl SQLiteIndex {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, schema: SchemaRef) -> Self {
+        Self { pool, schema }
     }
 
     /// Return the filenames / row groups that match the filter
-    /// 
+    ///
     /// This function pushes down the filter to the index to get a list of row groups that match
     /// and hence the files that need to be read.
-    /// 
+    ///
     /// The filter is pushed down to the index by converting it to a set of SQL expressions
     /// that can be evaluated by the index.
-    /// 
+    ///
     /// The return value is a list of `(file_name, FileScanPlan)` tuples where `FileScanPlan` contains
     /// the file metadata and the row groups that need to be scanned.
-    pub async fn get_files(&self, filter: Option<Expr>) -> Result<Vec<(String, FileScanPlan)>> {
-        let (sql, values) = Query::select()
-            .columns(vec![
-                FileStatistics::FileName,
-                FileStatistics::FileSizeBytes,
-                FileStatistics::RowGroupCount,
-            ])
-            .column(ColumnStatistics::RowGroup)
-            .distinct() // could be distinct_on(vec![ColumnStatistics::FileId, ColumnStatistics::RowGroup]) if the backing store supports it
-            .from(FileStatistics::Table)
-            .inner_join(
-                ColumnStatistics::Table,
-                SeaQExpr::col((FileStatistics::Table, FileStatistics::FileId)).equals((ColumnStatistics::Table, ColumnStatistics::FileId)),
-            )
-            .and_where_option(filter.and_then(|f| push_down_filter(&f)))
-            .build_sqlx(SqliteQueryBuilder);
+    pub async fn get_files(
+        &self,
+        filter: Arc<dyn PhysicalExpr>,
+        schema: SchemaRef,
+    ) -> Result<Vec<(String, FileScanPlan)>> {
+        let pruning = PruningPredicate::try_new(filter, schema.clone())?;
+
+        let statistics_predicate = pruning.predicate_expr();
+
+        // TODO: we can either convert the PhysicalExpr to an Expr and use expr_to_sql
+        // Or we convert it manually into SeaQuery expressions
+        // The former is likely less code, the latter would generalize more (there is no guarantee
+        // the index database supports DataFusion flavored SQL)
+        let expr = col("value_min").gt(lit(1));
+        let sql = format!(
+            "r#
+                WITH row_groups AS (
+                    SELECT row_group
+                    FROM row_group_statistics
+                    WHERE {}
+                )
+                SELECT file_name, file_size_bytes, row_group_count, row_group
+                FROM row_groups
+                JOIN file_statistics USING (file_id)
+            #",
+            expr_to_sql(&expr)?
+        );
 
         // TODO: we could aggregate the row groups into an array in the query to transmit less data over the wire
         // (and maybe avoid the join), leaving that as a TODO since it introduces more complexity and coupling to the index's backing store
         // Result is in the form of (file_name, file_size, row_group_count, row_group_to_scan)
-        let row_groups: Vec<(String, i64, i64, i64)> = sqlx::query_as_with(&sql, values)
+        let row_groups: Vec<(String, i64, i64, i64)> = sqlx::query_as(&sql)
             .fetch_all(&self.pool)
-            .await.unwrap(); // TODO: handle error, possibly failing gracefully by scanning all files?
+            .await
+            .unwrap(); // TODO: handle error, possibly failing gracefully by scanning all files?
 
-        
         let mut file_scans: HashMap<String, (i64, ParquetAccessPlan)> = HashMap::new(); // file_name -> (file_size, row_groups)
 
         for (file_name, file_size, file_row_group_counts, row_group_to_scan) in row_groups {
-            let (_, access_plan) = file_scans.entry(file_name).or_insert((file_size, ParquetAccessPlan::new_none(file_row_group_counts as usize)));
+            let (_, access_plan) = file_scans.entry(file_name).or_insert((
+                file_size,
+                ParquetAccessPlan::new_none(file_row_group_counts as usize),
+            ));
             // Here we could do finer grained row-level filtering, but this example does not implement that
             access_plan.set(row_group_to_scan as usize, RowGroupAccess::Scan)
         }
 
-        Ok(
-            file_scans.into_iter().map(|(file_name, (file_size, access_plan))| {
+        Ok(file_scans
+            .into_iter()
+            .map(|(file_name, (file_size, access_plan))| {
                 (
                     file_name,
                     FileScanPlan {
                         file_size: file_size as u64,
                         access_plan,
-                    }
+                    },
                 )
-            }).collect()
-        )
-            
+            })
+            .collect())
     }
 
     /// Add a new file to the index
@@ -144,96 +190,140 @@ impl SQLiteIndex {
         let parquet_schema = reader.parquet_schema();
         let row_groups = metadata.row_groups();
         let row_counts = StatisticsConverter::row_group_row_counts(row_groups.iter())?;
-        let mut column_statistics: Vec<ColumnStatisticsInsert> = Vec::with_capacity(reader.schema().fields().len() * metadata.num_row_groups());
+        let mut row_group_statistics: Vec<_> = row_counts
+            .iter()
+            .enumerate()
+            .map(|(row_group, row_count)| {
+                RowGroupStatisticsInsert::new(row_group as i64, row_count.unwrap() as i64)
+            })
+            .collect();
 
-        for column in 0..reader.schema().fields().len() {
-            let column_name = schema.field(column).name().clone();
+        for field in self.schema.fields() {
+            let column_name = field.name().clone();
             let converter = StatisticsConverter::try_new(&column_name, schema, parquet_schema)?;
             let min_values = converter.row_group_mins(row_groups.iter())?;
             let max_values = converter.row_group_maxes(row_groups.iter())?;
             let null_counts = converter.row_group_null_counts(row_groups.iter())?;
             let null_counts = null_counts.as_primitive::<UInt64Type>();
 
-            for row_group in 0..reader.metadata().num_row_groups() {
-                let stats = ColumnStatisticsInsertBuilder::new(
-                    column_name.clone(),
-                    row_group as i64,
-                    null_counts.value(row_group) as i64,
-                    row_counts.value(row_group) as i64,
-                );
-                // match on the data type of the column, downcast the array and extract the min/max values and build the statistics
-                match reader.schema().field(column).data_type() {
+            for row_group in 0..metadata.num_row_groups() {
+                match field.data_type() {
                     datafusion::arrow::datatypes::DataType::Int8 => {
-                        let min_values = min_values.as_primitive::<Int32Type>();
-                        let max_values = max_values.as_primitive::<Int32Type>();
+                        let min_values = min_values.as_primitive::<Int8Type>();
+                        let max_values = max_values.as_primitive::<Int8Type>();
                         let min = min_values.value(row_group) as i64;
                         let max = max_values.value(row_group) as i64;
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::UInt8 => {
-                        let min_values = min_values.as_primitive::<UInt16Type>();
-                        let max_values = max_values.as_primitive::<UInt16Type>();
+                        let min_values = min_values.as_primitive::<UInt8Type>();
+                        let max_values = max_values.as_primitive::<UInt8Type>();
                         let min = min_values.value(row_group) as i64;
                         let max = max_values.value(row_group) as i64;
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::Int16 => {
                         let min_values = min_values.as_primitive::<Int16Type>();
                         let max_values = max_values.as_primitive::<Int16Type>();
                         let min = min_values.value(row_group) as i64;
                         let max = max_values.value(row_group) as i64;
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::UInt16 => {
                         let min_values = min_values.as_primitive::<UInt16Type>();
                         let max_values = max_values.as_primitive::<UInt16Type>();
                         let min = min_values.value(row_group) as i64;
                         let max = max_values.value(row_group) as i64;
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::Int32 => {
                         let min_values = min_values.as_primitive::<Int32Type>();
                         let max_values = max_values.as_primitive::<Int32Type>();
                         let min = min_values.value(row_group) as i64;
                         let max = max_values.value(row_group) as i64;
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::UInt32 => {
                         let min_values = min_values.as_primitive::<UInt32Type>();
                         let max_values = max_values.as_primitive::<UInt32Type>();
                         let min = min_values.value(row_group) as i64;
                         let max = max_values.value(row_group) as i64;
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::Int64 => {
                         let min_values = min_values.as_primitive::<Int64Type>();
                         let max_values = max_values.as_primitive::<Int64Type>();
                         let min = min_values.value(row_group);
                         let max = max_values.value(row_group);
-                        let stats = stats.build(MinMaxStats::Int(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::Int(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::Utf8 => {
                         let min_values = min_values.as_string::<i32>();
                         let max_values = max_values.as_string::<i32>();
                         let min = min_values.value(row_group).to_string();
                         let max = max_values.value(row_group).to_string();
-                        let stats = stats.build(MinMaxStats::String(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::String(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     datafusion::arrow::datatypes::DataType::LargeUtf8 => {
                         let min_values = min_values.as_string::<i64>();
                         let max_values = max_values.as_string::<i64>();
                         let min = min_values.value(row_group).to_string();
                         let max = max_values.value(row_group).to_string();
-                        let stats = stats.build(MinMaxStats::String(min, max));
-                        column_statistics.push(stats);
+                        let column_statistics = ColumnStatistics {
+                            null_count: null_counts.value(row_group) as i64,
+                            stats: MinMaxStats::String(min, max),
+                        };
+                        row_group_statistics[row_group]
+                            .column_statistics
+                            .push(column_statistics);
                     }
                     _ => {} // ignore other types, we just don't put them in the index and filters will not be pushed down
                 }
@@ -247,95 +337,103 @@ impl SQLiteIndex {
             row_count: metadata.file_metadata().num_rows(),
         };
 
-        self.add_row(file_statistics, column_statistics).await?;
+        self.add_row(file_statistics, row_group_statistics).await?;
         Ok(())
     }
 
     async fn add_row(
         &self,
         file_statistics: FileStatisticsInsert,
-        column_statistics: Vec<ColumnStatisticsInsert>,
+        row_group_statistics: Vec<RowGroupStatisticsInsert>,
     ) -> anyhow::Result<()> {
         self.initialize().await?;
 
         let mut transaction = self.pool.begin().await?;
 
         let (sql, values) = Query::insert()
-        .into_table(FileStatistics::Table)
-        .columns(vec![
-            FileStatistics::FileName,
-            FileStatistics::FileSizeBytes,
-            FileStatistics::RowGroupCount,
-            FileStatistics::RowCount,
-        ])
-        .values_panic(vec![
-            file_statistics.file_name.into(),
-            file_statistics.file_size_bytes.into(),
-            file_statistics.row_group_count.into(),
-            file_statistics.row_count.into(),
-        ])
-        .on_conflict(
-            OnConflict::columns(vec![FileStatistics::FileName]).update_columns(
-                vec![
-                    FileStatistics::FileSizeBytes,
-                    FileStatistics::RowGroupCount,
-                    FileStatistics::RowCount,
-                ]
-            ).to_owned()
-        )
-        .returning(Query::returning().column(FileStatistics::FileId))
-        .build_sqlx(SqliteQueryBuilder);
-        let (file_id, ): (i64, ) = sqlx::query_as_with(&sql, values).fetch_one(&mut *transaction).await?;
+            .into_table(Alias::new("file_statistics"))
+            .columns(vec![
+                Alias::new("file_name"),
+                Alias::new("file_size_bytes"),
+                Alias::new("row_group_count"),
+                Alias::new("row_count"),
+            ])
+            .values_panic(vec![
+                file_statistics.file_name.into(),
+                file_statistics.file_size_bytes.into(),
+                file_statistics.row_group_count.into(),
+                file_statistics.row_count.into(),
+            ])
+            .on_conflict(
+                OnConflict::columns(vec![Alias::new("file_name")])
+                    .update_columns(vec![
+                        Alias::new("file_size_bytes"),
+                        Alias::new("row_group_count"),
+                        Alias::new("row_count"),
+                    ])
+                    .to_owned(),
+            )
+            .returning(Query::returning().column(Alias::new("file_id")))
+            .build_sqlx(SqliteQueryBuilder);
+        let (file_id,): (i64,) = sqlx::query_as_with(&sql, values)
+            .fetch_one(&mut *transaction)
+            .await?;
 
         // Delete any existing column statistics for this file
         let (sql, values) = Query::delete()
-            .from_table(ColumnStatistics::Table)
-            .and_where(SeaQExpr::col(ColumnStatistics::FileId).eq(file_id))
+            .from_table(Alias::new("row_group_statistics"))
+            .and_where(SeaQExpr::col(Alias::new("file_id")).eq(file_id))
             .build_sqlx(SqliteQueryBuilder);
-        sqlx::query_with(&sql, values).execute(&mut *transaction).await?;
+        sqlx::query_with(&sql, values)
+            .execute(&mut *transaction)
+            .await?;
 
-        for row_group_statistics in column_statistics {
-            let (sql, values) = Query::insert()
-                .into_table(ColumnStatistics::Table)
-                .columns(vec![
-                    ColumnStatistics::FileId,
-                    ColumnStatistics::ColumnName,
-                    ColumnStatistics::RowGroup,
-                    ColumnStatistics::NullCount,
-                    ColumnStatistics::RowCount,
-                    ColumnStatistics::IntMinValue,
-                    ColumnStatistics::IntMaxValue,
-                    ColumnStatistics::StringMinValue,
-                    ColumnStatistics::StringMaxValue,
-                ])
-                .values_panic({
-                    match row_group_statistics.stats {
-                        MinMaxStats::Int(min, max) => vec![
-                            file_id.into(),
-                            row_group_statistics.column_name.into(),
-                            row_group_statistics.row_group.into(),
-                            row_group_statistics.null_count.into(),
-                            row_group_statistics.row_count.into(),
-                            min.into(),
-                            max.into(),
-                            SqlValue::String(None).into(),
-                            SqlValue::String(None).into(),
-                        ],
-                        MinMaxStats::String(min, max) => vec![
-                            file_id.into(),
-                            row_group_statistics.column_name.into(),
-                            row_group_statistics.row_group.into(),
-                            row_group_statistics.null_count.into(),
-                            row_group_statistics.row_count.into(),
-                            SqlValue::Int(None).into(),
-                            SqlValue::Int(None).into(),
-                            min.into(),
-                            max.into(),
-                        ],
-                }})
-                .build_sqlx(SqliteQueryBuilder);
-            sqlx::query_with(&sql, values).execute(&mut *transaction).await?;
+        let mut columns = vec![
+            Alias::new("file_id"),
+            Alias::new("row_group"),
+            Alias::new("row_count"),
+        ];
+
+        for field in self.schema.fields() {
+            columns.push(Alias::new(format!("{}_null_count", field.name())));
+            columns.push(Alias::new(format!("{}_min", field.name())));
+            columns.push(Alias::new(format!("{}_max", field.name())));
         }
+
+        let mut query = Query::insert()
+            .into_table(Alias::new("row_group_statistics"))
+            .columns(columns)
+            .to_owned();
+
+        for statistics in row_group_statistics {
+            let mut values: Vec<SimpleExpr> = vec![
+                file_id.into(),
+                statistics.row_group.into(),
+                statistics.row_count.into(),
+            ];
+            for stats in statistics.column_statistics {
+                match stats.stats {
+                    MinMaxStats::Int(min, max) => {
+                        values.push(stats.null_count.into());
+                        values.push(min.into());
+                        values.push(max.into());
+                    }
+                    MinMaxStats::String(min, max) => {
+                        values.push(stats.null_count.into());
+                        values.push(min.into());
+                        values.push(max.into());
+                    }
+                }
+            }
+
+            query = query.values_panic(values).to_owned();
+        }
+
+        let (sql, values) = query.build_sqlx(SqliteQueryBuilder);
+
+        sqlx::query_with(&sql, values)
+            .execute(&mut *transaction)
+            .await?;
 
         transaction.commit().await?;
 
@@ -344,32 +442,38 @@ impl SQLiteIndex {
 
     /// Simple migration function that idempotently creates the table for the index
     pub async fn initialize(&self) -> anyhow::Result<()> {
-        let query = sea_query::Table::create()
-            .table(FileStatistics::Table)
-            .if_not_exists()
-            .col(sea_query::ColumnDef::new(FileStatistics::FileId).big_integer().auto_increment().primary_key())
-            .col(sea_query::ColumnDef::new(FileStatistics::FileName).string().not_null().unique_key())
-            .col(sea_query::ColumnDef::new(FileStatistics::FileSizeBytes).big_integer().not_null())
-            .col(sea_query::ColumnDef::new(FileStatistics::RowGroupCount).big_integer().not_null())
-            .col(sea_query::ColumnDef::new(FileStatistics::RowCount).big_integer().not_null())
-            .build(SqliteQueryBuilder);
-
+        let query = r#"
+            CREATE TABLE IF NOT EXISTS file_statistics (
+                file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT NOT NULL UNIQUE,
+                file_size_bytes INTEGER NOT NULL,
+                row_group_count INTEGER NOT NULL,
+                row_count INTEGER NOT NULL
+            )
+        "#;
         sqlx::query(&query).execute(&self.pool).await?;
 
-        let query = sea_query::Table::create()
-            .table(ColumnStatistics::Table)
-            .if_not_exists()
-            .col(sea_query::ColumnDef::new(ColumnStatistics::FileId).big_integer().not_null())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::ColumnName).string().not_null())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::RowGroup).big_integer().not_null())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::NullCount).big_integer())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::RowCount).big_integer())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::IntMinValue).big_integer())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::IntMaxValue).big_integer())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::StringMinValue).string())
-            .col(sea_query::ColumnDef::new(ColumnStatistics::StringMaxValue).string())
-            .build(SqliteQueryBuilder);
-
+        // The statistics columns are hardcoded in this example
+        // It would be up to you to decide if this is appropriate for your use case
+        // You could also store the statistics in a more flexible way, e.g. as a JSON blob or as an entity-attribute-value table
+        let query = r#"
+            CREATE TABLE IF NOT EXISTS column_statistics (
+                file_id INTEGER NOT NULL,
+                row_group INTEGER NOT NULL,
+                row_count INTEGER NOT NULL,
+                file_name_null_count INTEGER NOT NULL,
+                file_name_min_value TEXT,
+                file_name_max_value TEXT,
+                value_null_count INTEGER NOT NULL,
+                value_min_value INTEGER,
+                value_max_value INTEGER,
+                text_null_count INTEGER NOT NULL,
+                text_min_value TEXT,
+                text_max_value TEXT,
+                PRIMARY KEY (file_id, column_name, row_group),
+                FOREIGN KEY (file_id) REFERENCES file_statistics(file_id)
+            )
+        "#;
         sqlx::query(&query).execute(&self.pool).await?;
 
         Ok(())
@@ -382,31 +486,6 @@ pub struct FileScanPlan {
     pub access_plan: ParquetAccessPlan,
 }
 
-#[derive(Debug, Clone, Iden)]
-enum FileStatistics {
-    Table,
-    FileId,
-    FileName,
-    FileSizeBytes,
-    RowGroupCount,
-    RowCount,
-}
-
-#[derive(Debug, Clone, Iden)]
-enum ColumnStatistics {
-    Table,
-    FileId,
-    ColumnName,
-    RowGroup,
-    NullCount,
-    RowCount,
-    IntMinValue,
-    IntMaxValue,
-    StringMinValue,
-    StringMaxValue,
-    // Extend with other types as needed
-}
-
 #[derive(Debug, Clone)]
 pub enum MinMaxStats {
     Int(i64, i64),
@@ -414,42 +493,27 @@ pub enum MinMaxStats {
 }
 
 #[derive(Debug, Clone)]
-pub struct ColumnStatisticsInsert {
-    pub column_name: String,
+pub struct RowGroupStatisticsInsert {
     pub row_group: i64,
-    pub null_count: i64,
     pub row_count: i64,
-    stats: MinMaxStats,
+    /// Per-column statistics
+    pub column_statistics: Vec<ColumnStatistics>,
 }
 
+impl RowGroupStatisticsInsert {
+    pub fn new(row_group: i64, row_count: i64) -> Self {
+        Self {
+            row_group,
+            row_count,
+            column_statistics: vec![],
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
-pub struct ColumnStatisticsInsertBuilder {
-    column_name: String,
-    row_group: i64,
+pub struct ColumnStatistics {
     null_count: i64,
-    row_count: i64,
-}
-
-impl ColumnStatisticsInsertBuilder {
-    pub fn new(column_name: String, row_group: i64, null_count: i64, row_count: i64) -> Self {
-        Self {
-            column_name,
-            row_group,
-            null_count,
-            row_count,
-        }
-    }
-
-    pub fn build(self, stats: MinMaxStats) -> ColumnStatisticsInsert {
-        ColumnStatisticsInsert {
-            column_name: self.column_name,
-            row_group: self.row_group,
-            null_count: self.null_count,
-            row_count: self.row_count,
-            stats,
-        }
-    }
+    stats: MinMaxStats,
 }
 
 #[derive(Debug, Clone)]
@@ -458,148 +522,4 @@ struct FileStatisticsInsert {
     file_size_bytes: i64,
     row_group_count: i64,
     row_count: i64,
-}
-
-
-pub fn push_down_filter(filter: &Expr) -> Option<SimpleExpr> {
-    match filter {
-        Expr::BinaryExpr(binary_expr) => {
-            match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
-                (Expr::Column(column), Expr::Literal(value)) => {
-                    // This is something we can push down!
-                    let column_name = column.name;
-                    let filter = push_down_binary_filter(&value, &binary_expr.op);
-                    filter.map(|filter| SeaQExpr::col(ColumnStatistics::ColumnName).eq(column_name).and(filter))
-                }
-                (left, right) => {
-                    let left_pushdown = push_down_filter(&left);
-                    let right_pushdown = push_down_filter(&right);
-                    match (left_pushdown, right_pushdown, binary_expr.op) {
-                        (Some(left_pushdown), Some(right_pushdown), op) => {
-                            match op {
-                                Operator::And => {
-                                    Some(left_pushdown.and(right_pushdown))
-                                },
-                                Operator::Or => {
-                                    Some(left_pushdown.or(right_pushdown))
-                                },
-                                _ => {
-                                    None
-                                }
-                            }
-                        }
-                        // If we have A AND B but we can't push down B we can still push down A
-                        // because A must be true for the whole expression to be true
-                        (Some(left_pushdown), None, Operator::And) => Some(left_pushdown),
-                        // Same for the other side
-                        (None, Some(right_pushdown), Operator::And) => Some(right_pushdown),
-                        _ => None
-                    }
-                }
-            }
-        },
-        Expr::Not(inner) => {
-            let inner_pushdown = push_down_filter(inner);
-            inner_pushdown.map(|inner_pushdown| inner_pushdown.not())
-        },
-        // We could handle more cases here, e.g. `LIKE`, `IN`, etc.
-        // But this example does not implement those to keep complexity under control
-        _ => None
-    }
-}
-
-/// Push down a simple binary expression to the index
-/// Only a subset of expressions are supported since `a = 1` has to be rewritten as `a_int_max_value >= 1 AND a_int_min_value <= 1`
-fn push_down_binary_filter(value: &ScalarValue, op: &Operator) -> Option<SimpleExpr> {
-    let (min_col, max_col, sql_value) = match value {
-        ScalarValue::Int8(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(Some(*v as i32))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(None)),
-            }
-        },
-        ScalarValue::UInt8(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(Some(*v as i32))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(None)),
-            }
-        },
-        ScalarValue::Int16(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(Some(*v as i32))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(None)),
-            }
-        },
-        ScalarValue::UInt16(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(Some(*v as i32))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(None)),
-            }
-        },
-        ScalarValue::Int32(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(Some(*v))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::Int(None)),
-            }
-        },
-        ScalarValue::UInt32(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::BigInt(Some(*v as i64))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::BigInt(None)),
-            }
-        },
-        ScalarValue::Int64(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::BigInt(Some(*v))),
-                None => (ColumnStatistics::IntMinValue, ColumnStatistics::IntMaxValue, SqlValue::BigInt(None)),
-            }
-        },
-        ScalarValue::Utf8(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::StringMinValue, ColumnStatistics::StringMaxValue, SqlValue::String(Some(Box::new(v.clone())))),
-                None => (ColumnStatistics::StringMinValue, ColumnStatistics::StringMaxValue, SqlValue::String(None)),
-            }
-        },
-        ScalarValue::LargeUtf8(v) => {
-            match v {
-                Some(v) => (ColumnStatistics::StringMinValue, ColumnStatistics::StringMaxValue, SqlValue::String(Some(Box::new(v.clone())))),
-                None => (ColumnStatistics::StringMinValue, ColumnStatistics::StringMaxValue, SqlValue::String(None)),
-            }
-        },
-        _ => return None,
-    };
-    let min_col = SeaQExpr::col(min_col);
-    let max_col = SeaQExpr::col(max_col);
-    let expr = match op {
-        Operator::Eq => {
-            min_col.lte(sql_value.clone()).and(max_col.gte(sql_value))
-        },
-        Operator::Gt => {
-            max_col.gt(sql_value)
-        },
-        Operator::Lt => {
-            min_col.lt(sql_value)
-        },
-        Operator::GtEq => {
-            max_col.gte(sql_value)
-        },
-        Operator::LtEq => {
-            min_col.lte(sql_value)
-        },
-        Operator::LikeMatch => {
-            // Find a prefix in the LIKE pattern and use it to filter
-            match sql_value {
-                SqlValue::String(Some(pattern)) => {
-                    let mut prefix = pattern.clone();
-                    let prefix_len = prefix.chars().position(|c| c == '%').unwrap_or_else(|| prefix.len());
-                    prefix.truncate(prefix_len);
-                    min_col.lte(SqlValue::String(Some(prefix.clone()))).and(max_col.gte(SqlValue::String(Some(prefix))))
-                },
-                _ => return None
-            }
-        },
-        // In theory we could handle other operators, but this example does not implement that
-        _ => return None
-    };
-    Some(expr)
 }
