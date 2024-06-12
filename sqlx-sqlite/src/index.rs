@@ -2,24 +2,24 @@ use std::{collections::HashMap, fmt::Display, fs::File, path::Path, sync::Arc};
 
 use datafusion::arrow::array::AsArray;
 use datafusion::arrow::datatypes::{
-    Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef, UInt16Type, UInt32Type, UInt64Type,
-    UInt8Type,
+    DataType, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef, UInt16Type, UInt32Type, UInt64Type, UInt8Type
 };
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::{
     datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess, StatisticsConverter},
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
-use datafusion_common::{internal_datafusion_err, DataFusionError, Result};
-use datafusion_expr::{col, lit};
+use datafusion_common::tree_node::TreeNode;
+use datafusion_common::{internal_datafusion_err, DataFusionError, Result, tree_node::{Transformed, TransformedResult}};
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_sql::unparser::expr_to_sql;
 use sea_query::{
-    Alias, Expr as SeaQExpr, OnConflict, Query, SimpleExpr,
-    SqliteQueryBuilder,
+    Alias, ColumnDef, CommonTableExpression, Expr as SeaQExpr, ForeignKey, ForeignKeyAction, Index, OnConflict, Query, SimpleExpr, SqliteQueryBuilder, Table, WithClause
 };
 use sea_query_binder::SqlxBinder;
 use sqlx::SqlitePool;
+use datafusion_physical_expr::expressions as phys_expr;
+
+use crate::rewrite::physical_expr_to_sea_query;
 
 /// SQLite secondary index for a set of parquet files
 ///
@@ -113,33 +113,55 @@ impl SQLiteIndex {
         filter: Arc<dyn PhysicalExpr>,
         schema: SchemaRef,
     ) -> Result<Vec<(String, FileScanPlan)>> {
+        // Convert the predicate to a pruning predicate
+        // This transforms e.g. `a = 5` to `a_min <= 5 AND a_max >= 5`
         let pruning = PruningPredicate::try_new(filter, schema.clone())?;
+        let predicate = pruning.predicate_expr().clone();
+        // Replace any `{col}_row_count` with `row_count` as we don't store per-column row counts
+        let predicate = predicate.transform(|expr| {
+            if let Some(column) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+                if column.name().ends_with("_row_count") {
+                    let column = phys_expr::Column::new(column.name().trim_end_matches("_row_count"), column.index());
+                    return Ok(Transformed::yes(Arc::new(column)));
+                }
+            }
+            Ok(Transformed::no(expr))
+        }).data()?;
+        // Convert a DataFusion PhysicalExpr to a SeaQuery SimpleExpr
+        let predicate = physical_expr_to_sea_query(&predicate);
 
-        let statistics_predicate = pruning.predicate_expr();
+        let stats_query = Query::select()
+            .from(Alias::new("row_group_statistics"))
+            .columns(vec![
+                Alias::new("file_id"),
+                Alias::new("row_group"),
+            ])
+            .and_where(predicate).to_owned();
+        
+        let cte = CommonTableExpression::new()
+            .query(stats_query)
+            .table_name(Alias::new("row_groups")).to_owned();
 
-        // TODO: we can either convert the PhysicalExpr to an Expr and use expr_to_sql
-        // Or we convert it manually into SeaQuery expressions
-        // The former is likely less code, the latter would generalize more (there is no guarantee
-        // the index database supports DataFusion flavored SQL)
-        let expr = col("value_min").gt(lit(1));
-        let sql = format!(
-            "r#
-                WITH row_groups AS (
-                    SELECT row_group
-                    FROM row_group_statistics
-                    WHERE {}
-                )
-                SELECT file_name, file_size_bytes, row_group_count, row_group
-                FROM row_groups
-                JOIN file_statistics USING (file_id)
-            #",
-            expr_to_sql(&expr)?
-        );
+        let files_query = Query::select()
+            .from(Alias::new("file_statistics"))
+            .columns(vec![
+                Alias::new("file_name"),
+                Alias::new("file_size_bytes"),
+                Alias::new("row_group_count"),
+            ])
+            .inner_join(
+                Alias::new("row_groups"), 
+                SeaQExpr::col((Alias::new("file_statistics"), Alias::new("file_id"))).equals((Alias::new("row_groups"), Alias::new("file_id"))),
+            )
+            .column(Alias::new("row_group"))
+            .distinct()
+            .to_owned();
 
-        // TODO: we could aggregate the row groups into an array in the query to transmit less data over the wire
-        // (and maybe avoid the join), leaving that as a TODO since it introduces more complexity and coupling to the index's backing store
-        // Result is in the form of (file_name, file_size, row_group_count, row_group_to_scan)
-        let row_groups: Vec<(String, i64, i64, i64)> = sqlx::query_as(&sql)
+        let query = files_query.with(WithClause::new().cte(cte).to_owned());
+
+        let (sql, values) = query.build_sqlx(SqliteQueryBuilder);
+
+        let row_groups: Vec<(String, i64, i64, i64)> = sqlx::query_as_with(&sql, values)
             .fetch_all(&self.pool)
             .await
             .unwrap(); // TODO: handle error, possibly failing gracefully by scanning all files?
@@ -456,27 +478,87 @@ impl SQLiteIndex {
         // The statistics columns are hardcoded in this example
         // It would be up to you to decide if this is appropriate for your use case
         // You could also store the statistics in a more flexible way, e.g. as a JSON blob or as an entity-attribute-value table
-        let query = r#"
-            CREATE TABLE IF NOT EXISTS column_statistics (
-                file_id INTEGER NOT NULL,
-                row_group INTEGER NOT NULL,
-                row_count INTEGER NOT NULL,
-                file_name_null_count INTEGER NOT NULL,
-                file_name_min_value TEXT,
-                file_name_max_value TEXT,
-                value_null_count INTEGER NOT NULL,
-                value_min_value INTEGER,
-                value_max_value INTEGER,
-                text_null_count INTEGER NOT NULL,
-                text_min_value TEXT,
-                text_max_value TEXT,
-                PRIMARY KEY (file_id, column_name, row_group),
-                FOREIGN KEY (file_id) REFERENCES file_statistics(file_id)
+        // let query = r#"
+        //     CREATE TABLE IF NOT EXISTS row_group_statistics (
+        //         file_id INTEGER NOT NULL,
+        //         row_group INTEGER NOT NULL,
+        //         row_count INTEGER NOT NULL,
+        //         PRIMARY KEY (file_id, row_group),
+        //         FOREIGN KEY (file_id) REFERENCES file_statistics(file_id)
+        //     )
+        // "#;
+        // sqlx::query(&query).execute(&self.pool).await?;
+
+        let sql = Table::create()
+            .table(Alias::new("file_statistics"))
+            .if_not_exists()
+            .col(ColumnDef::new(Alias::new("file_id")).integer().primary_key().auto_increment())
+            .col(ColumnDef::new(Alias::new("file_name")).string().not_null().unique_key())
+            .col(ColumnDef::new(Alias::new("file_size_bytes")).integer().not_null())
+            .col(ColumnDef::new(Alias::new("row_group_count")).integer().not_null())
+            .col(ColumnDef::new(Alias::new("row_count")).integer().not_null())
+            .to_owned()
+            .build(SqliteQueryBuilder);
+
+        sqlx::query(&sql).execute(&self.pool).await?;
+
+        let mut table = Table::create()
+            .table(Alias::new("row_group_statistics"))
+            .if_not_exists()
+            .col(ColumnDef::new(Alias::new("file_id")).integer().not_null())
+            .col(ColumnDef::new(Alias::new("row_group")).integer().not_null())
+            .col(ColumnDef::new(Alias::new("row_count")).integer().not_null())
+            .primary_key(Index::create().col(Alias::new("file_id")).col(Alias::new("row_group")))
+            .foreign_key(
+                ForeignKey::create()
+                    .from(Alias::new("row_group_statistics"), Alias::new("file_id"))
+                    .to(Alias::new("file_statistics"), Alias::new("file_id"))
+                    .on_delete(ForeignKeyAction::Cascade)
             )
-        "#;
-        sqlx::query(&query).execute(&self.pool).await?;
+            .to_owned();
+
+        for field in self.schema.fields().iter() {
+            table.col(
+                ColumnDef::new(Alias::new(format!("{}_null_count", field.name())))
+                .integer()
+                .not_null()
+            );
+            for suffix in ["min", "max"] {
+                let mut stats_col = ColumnDef::new(Alias::new(format!("{}_{}", field.name(), suffix)));
+                set_column_type(&mut stats_col, field.data_type().clone());
+                if !field.is_nullable() {
+                    stats_col.not_null();
+                }
+                table.col(&mut stats_col);
+            }
+        }
+
+        let sql = table.build(SqliteQueryBuilder);
+
+        sqlx::query(&sql).execute(&self.pool).await?;
 
         Ok(())
+    }
+}
+
+fn set_column_type(column: &mut ColumnDef, field_type: DataType) -> &mut ColumnDef {
+    match field_type {
+        DataType::Int8 => column.tiny_integer(),
+        DataType::UInt8 => column.tiny_unsigned(),
+        DataType::Int16 => column.small_integer(),
+        DataType::UInt16 => column.small_unsigned(),
+        DataType::Int32 => column.integer(),
+        DataType::UInt32 => column.unsigned(),
+        DataType::Int64 => column.big_integer(),
+        DataType::UInt64 => column.big_unsigned(),
+        DataType::Float32 => column.float(),
+        DataType::Float64 => column.double(),
+        DataType::Utf8 => column.string(),
+        DataType::LargeUtf8 => column.string(),
+        DataType::Binary => column.binary(),
+        DataType::FixedSizeBinary(_) => column.binary(),
+        DataType::LargeBinary => column.binary(),
+        _ => todo!("Add support for more types"),
     }
 }
 

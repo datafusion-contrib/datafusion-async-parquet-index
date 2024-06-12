@@ -25,6 +25,7 @@ use url::Url;
 use crate::index::SQLiteIndex;
 
 mod index;
+mod rewrite;
 
 /// This example demonstrates building a secondary index over multiple Parquet
 /// files and using that index during query to skip ("prune") files and row groups
@@ -102,10 +103,13 @@ async fn main() -> anyhow::Result<()> {
     // Create a table provider with and  our special index.
     let index = SQLiteIndex::new(
         pool.clone(),
+        // You probably don't want to index _every_ column in your data
+        // For example, indexing a column of random strings like a UUID would be pointless
+        // using a min/max based index like this.
+        // In this example we choose to index only the "value" and "text" columns, ignoring "file_name"
         Arc::new(
             Schema::new(
                 vec![
-                    Field::new("file_name", DataType::Utf8, false),
                     Field::new("value", DataType::Int32, false),
                     Field::new("text", DataType::Utf8, false),
                 ]
@@ -151,6 +155,30 @@ async fn main() -> anyhow::Result<()> {
     ctx.sql(
         "SELECT file_name, count(value) FROM index_table \
             WHERE value < 20 OR value > 500 GROUP BY file_name",
+    )
+    .await?
+    .show()
+    .await?;
+    println!("Files scanned: {:?}\n", provider.last_execution());
+
+
+    // it's also possible to combine predicates on multiple columns
+    // for example `value < 20 AND text = 'a'` would only read file 1
+    // while `value > 500 AND text = 'a'` would read no files
+    println!("** Select data, predicate `value < 20 AND text = 'a'`");
+    ctx.sql(
+        "SELECT file_name, count(value) FROM index_table \
+            WHERE value < 20 AND text = 'a' GROUP BY file_name",
+    )
+    .await?
+    .show()
+    .await?;
+    println!("Files scanned: {:?}\n", provider.last_execution());
+
+    println!("** Select data, predicate `value > 500 AND text = 'a'`");
+    ctx.sql(
+        "SELECT file_name, count(value) FROM index_table \
+            WHERE value > 500 AND text = 'a' GROUP BY file_name",
     )
     .await?
     .show()
@@ -345,8 +373,20 @@ fn make_demo_file(path: impl AsRef<Path>, value_range: Range<i32>) -> Result<()>
     let num_values = value_range.len();
     let file_names = StringArray::from_iter_values(std::iter::repeat(&filename).take(num_values));
     let values = Int32Array::from_iter_values(value_range.clone());
+
+    fn int_to_chars(mut n: i32) -> String {
+        let mut result = String::new();
+        while n > 0 {
+            n -= 1;
+            let c = (n % 26) as u8 + b'a';
+            result.push(c as char);
+            n /= 26;
+        }
+        result.chars().rev().collect()
+    }
+
     let texts: StringArray = value_range
-        .map(|i| format!("text{}", i))
+        .map(int_to_chars)
         .collect::<Vec<_>>()
         .into();
     let batch = RecordBatch::try_from_iter(vec![
