@@ -85,8 +85,10 @@ impl Display for SQLiteIndex {
 }
 
 impl SQLiteIndex {
-    pub fn new(pool: SqlitePool, schema: SchemaRef) -> Self {
-        Self { pool, schema }
+    pub async fn try_new(pool: SqlitePool, schema: SchemaRef) -> anyhow::Result<Self> {
+        let r = Self { pool, schema };
+        r.initialize().await?;
+        Ok(r)
     }
 
     /// Return the filenames / row groups that match the filter
@@ -160,29 +162,19 @@ impl SQLiteIndex {
             .await
             .unwrap(); // TODO: handle error, possibly failing gracefully by scanning all files?
 
-        let mut file_scans: HashMap<String, (i64, ParquetAccessPlan)> = HashMap::new(); // file_name -> (file_size, row_groups)
+        let mut file_scans: HashMap<String, FileScanPlan> = HashMap::new(); // file_name -> (file_size, row_groups)
 
         for (file_name, file_size, file_row_group_counts, row_group_to_scan) in row_groups {
-            let (_, access_plan) = file_scans.entry(file_name).or_insert((
-                file_size,
-                ParquetAccessPlan::new_none(file_row_group_counts as usize),
-            ));
-            // Here we could do finer grained row-level filtering, but this example does not implement that
-            access_plan.set(row_group_to_scan as usize, RowGroupAccess::Scan)
+            let file_scan_plan = file_scans.entry(file_name.clone()).or_insert(
+                FileScanPlan {
+                    file_size: file_size as u64,
+                    access_plan: ParquetAccessPlan::new_none(file_row_group_counts as usize),
+                }
+            );
+            file_scan_plan.access_plan.set(row_group_to_scan as usize, RowGroupAccess::Scan);
         }
 
-        Ok(file_scans
-            .into_iter()
-            .map(|(file_name, (file_size, access_plan))| {
-                (
-                    file_name,
-                    FileScanPlan {
-                        file_size: file_size as u64,
-                        access_plan,
-                    },
-                )
-            })
-            .collect())
+        Ok(file_scans.into_iter().map(|(file_name, file_scan_plan)| (file_name, file_scan_plan)).collect())
     }
 
     /// Add a new file to the index
@@ -362,8 +354,6 @@ impl SQLiteIndex {
         file_statistics: FileStatisticsInsert,
         row_group_statistics: Vec<RowGroupStatisticsInsert>,
     ) -> anyhow::Result<()> {
-        self.initialize().await?;
-
         let mut transaction = self.pool.begin().await?;
 
         let (sql, values) = Query::insert()
@@ -457,7 +447,7 @@ impl SQLiteIndex {
     }
 
     /// Simple migration function that idempotently creates the table for the index
-    pub async fn initialize(&self) -> anyhow::Result<()> {
+    async fn initialize(&self) -> anyhow::Result<()> {
         let query = r#"
             CREATE TABLE IF NOT EXISTS file_statistics (
                 file_id INTEGER PRIMARY KEY AUTOINCREMENT,

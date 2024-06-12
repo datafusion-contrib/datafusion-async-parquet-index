@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let data = DemoData::try_new()?;
 
     // Create a table provider with and  our special index.
-    let index = SQLiteIndex::new(
+    let index = SQLiteIndex::try_new(
         pool.clone(),
         // You probably don't want to index _every_ column in your data
         // For example, indexing a column of random strings like a UUID would be pointless
@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 ]
             )
         )
-    );
+    ).await?;
     let provider = Arc::new(IndexTableProvider::try_new(data.path(), index).await?);
     println!("** Table Provider:");
     println!("{provider}\n");
