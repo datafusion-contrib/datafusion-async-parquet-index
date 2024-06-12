@@ -4,6 +4,7 @@ use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
 use sea_query::{Alias, BinOper, CaseStatement, ColumnRef, IntoIden, SimpleExpr, Value};
 
 
+/// Convert a DataFusion PhysicalExpr to a SeaQuery SimpleExpr
 pub fn physical_expr_to_sea_query(expr: &PhysicalExprRef) -> SimpleExpr {
     if let Some(expr) = expr.as_any().downcast_ref::<phys_expr::BinaryExpr>(){
         let left = physical_expr_to_sea_query(expr.left());

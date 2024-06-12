@@ -118,6 +118,7 @@ impl SQLiteIndex {
         let pruning = PruningPredicate::try_new(filter, schema.clone())?;
         let predicate = pruning.predicate_expr().clone();
         // Replace any `{col}_row_count` with `row_count` as we don't store per-column row counts
+        // (they're the same for all columns in a row group)
         let predicate = predicate.transform(|expr| {
             if let Some(column) = expr.as_any().downcast_ref::<phys_expr::Column>() {
                 if column.name().ends_with("_row_count") {
