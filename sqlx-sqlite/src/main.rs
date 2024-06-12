@@ -25,7 +25,7 @@ use url::Url;
 use crate::index::SQLiteIndex;
 
 mod index;
-mod rewrite;
+mod conversions;
 
 /// This example demonstrates building a secondary index over multiple Parquet
 /// files and using that index during query to skip ("prune") files and row groups
