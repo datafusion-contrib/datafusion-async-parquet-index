@@ -130,55 +130,9 @@ async fn main() -> anyhow::Result<()> {
     let object_store = object_store::local::LocalFileSystem::new();
     ctx.register_object_store(&url, Arc::new(object_store));
 
-    // Select data from the table without any predicates (and thus no pruning)
-    println!("** Select data, no predicates:");
-    ctx.sql("SELECT file_name, value FROM index_table LIMIT 10")
-        .await?
-        .show()
-        .await?;
-    println!("Files scanned: {:?}\n", provider.last_execution());
-
-    // Run a query that uses the index to prune files.
-    //
-    // Using the predicate "value = 150", the IndexTable can skip reading file 1
-    // (max value 100) and file 3 (min value of 200)
-    println!("** Select data, predicate `value = 150`");
-    ctx.sql("SELECT file_name, value FROM index_table WHERE value = 150")
-        .await?
-        .show()
-        .await?;
-    println!("Files scanned: {:?}\n", provider.last_execution());
-
-    // likewise, we can use a more complicated predicate like
-    // "value < 20 OR value > 500" to read only file 1 and file 3
-    println!("** Select data, predicate `value < 20 OR value > 500`");
-    ctx.sql(
-        "SELECT file_name, count(value) FROM index_table \
-            WHERE value < 20 OR value > 500 GROUP BY file_name",
-    )
-    .await?
-    .show()
-    .await?;
-    println!("Files scanned: {:?}\n", provider.last_execution());
-
-
-    // it's also possible to combine predicates on multiple columns
-    // for example `value < 20 AND text = 'a'` would only read file 1
-    // while `value > 500 AND text = 'a'` would read no files
-    println!("** Select data, predicate `value < 20 AND text = 'a'`");
-    ctx.sql(
-        "SELECT file_name, count(value) FROM index_table \
-            WHERE value < 20 AND text = 'a' GROUP BY file_name",
-    )
-    .await?
-    .show()
-    .await?;
-    println!("Files scanned: {:?}\n", provider.last_execution());
-
     println!("** Select data, predicate `value > 500 AND text = 'a'`");
     ctx.sql(
-        "SELECT file_name, count(value) FROM index_table \
-            WHERE value > 500 AND text = 'a' GROUP BY file_name",
+        "SELECT message FROM index_table WHERE trace_id = '42c00c567830ee7b09952cebd1f74652'",
     )
     .await?
     .show()

@@ -12,11 +12,11 @@ datafusion-optimizer = { git = "https://github.com/apache/datafusion.git" }
 datafusion-common = { git = "https://github.com/apache/datafusion.git" }
 datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git" }
 datafusion-sql = { git = "https://github.com/apache/datafusion.git" }
-sqlx = { version = "~0", features = [ "runtime-tokio", "sqlite" ] }
+sqlx = { version = "~0", features = [ "runtime-tokio", "sqlite", "chrono" ] }
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = [ "rt-multi-thread", "macros" ] }
 url = "2"
 object_store = { version = "0" }
-sea-query = { version = "0", features = ["backend-sqlite", "hashable-value", "derive", "thread-safe"] }
-sea-query-binder = { version = "0", features = ["sqlx-sqlite" ] }
+sea-query = { version = "0", features = ["backend-sqlite", "hashable-value", "derive", "thread-safe", "with-chrono"] }
+sea-query-binder = { version = "0", features = ["sqlx-sqlite", "with-chrono" ] }

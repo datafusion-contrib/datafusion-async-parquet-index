@@ -1,4 +1,5 @@
-use datafusion::arrow::{array::{Array, ArrayRef, AsArray}, datatypes::DataType};
+use datafusion::arrow::{array::{Array, ArrayRef, AsArray}, datatypes::{DataType, TimeUnit}};
+use datafusion::arrow::temporal_conversions;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Operator;
 use datafusion::arrow::datatypes;
@@ -66,6 +67,96 @@ pub fn physical_expr_to_sea_query(expr: &PhysicalExprRef) -> SimpleExpr {
             ScalarValue::LargeBinary(v) => match v {
                 Some(v) => SimpleExpr::Constant(Value::Bytes(Some(Box::new(v.to_vec())))),
                 None => SimpleExpr::Constant(Value::Bytes(None)),
+            },
+            ScalarValue::Date32(v) => {
+                match v {
+                    Some(v) => {
+                        let date = temporal_conversions::date32_to_datetime(*v).unwrap().date();
+                        SimpleExpr::Constant(Value::ChronoDate(Some(Box::new(date))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoDate(None))
+                }
+            },
+            ScalarValue::Date64(v) => {
+                match v {
+                    Some(v) => {
+                        let date = temporal_conversions::date64_to_datetime(*v).unwrap().date();
+                        SimpleExpr::Constant(Value::ChronoDate(Some(Box::new(date))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoDate(None))
+                }
+            },
+            ScalarValue::Time64Nanosecond(v) => {
+                match v {
+                    Some(v) => {
+                        let time = temporal_conversions::time64ns_to_time(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoTime(Some(Box::new(time))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoTime(None))
+                }
+            },
+            ScalarValue::Time64Microsecond(v) => {
+                match v {
+                    Some(v) => {
+                        let time = temporal_conversions::time64us_to_time(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoTime(Some(Box::new(time))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoTime(None))
+                }
+            },
+            ScalarValue::Time32Millisecond(v) => {
+                match v {
+                    Some(v) => {
+                        let time = temporal_conversions::time32ms_to_time(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoTime(Some(Box::new(time))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoTime(None))
+                }
+            },
+            ScalarValue::Time32Second(v) => {
+                match v {
+                    Some(v) => {
+                        let time = temporal_conversions::time32s_to_time(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoTime(Some(Box::new(time))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoTime(None))
+                }
+            },
+            ScalarValue::TimestampNanosecond(v, None) => {
+                match v {
+                    Some(v) => {
+                        let datetime = temporal_conversions::timestamp_ns_to_datetime(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoDateTime(Some(Box::new(datetime))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoDateTime(None))
+                }
+            },
+            ScalarValue::TimestampMicrosecond(v, None) => {
+                match v {
+                    Some(v) => {
+                        let datetime = temporal_conversions::timestamp_us_to_datetime(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoDateTime(Some(Box::new(datetime))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoDateTime(None))
+                }
+            },
+            ScalarValue::TimestampMillisecond(v, None) => {
+                match v {
+                    Some(v) => {
+                        let datetime = temporal_conversions::timestamp_ms_to_datetime(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoDateTime(Some(Box::new(datetime))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoDateTime(None))
+                }
+            },
+            ScalarValue::TimestampSecond(v, None) => {
+                match v {
+                    Some(v) => {
+                        let datetime = temporal_conversions::timestamp_s_to_datetime(*v).unwrap();
+                        SimpleExpr::Constant(Value::ChronoDateTime(Some(Box::new(datetime))))
+                    },
+                    None => SimpleExpr::Constant(Value::ChronoDateTime(None))
+                }
             },
             // Extend with other types, e.g. to support arrays, dates, etc.
             _ => SimpleExpr::Constant(Value::Bool(Some(true)))
@@ -221,6 +312,140 @@ pub fn array_to_values(array: ArrayRef) -> Option<Vec<Value>> {
                     None => Value::Bytes(None)
                 }
             }).collect()
+        }
+        DataType::Date32 => {
+            let array = array.as_primitive::<datatypes::Date32Type>();
+            array.iter().map(|v| {
+                match v {
+                    Some(v) => {
+                        let date = temporal_conversions::date32_to_datetime(v).unwrap().date();
+                        Value::ChronoDate(Some(Box::new(date)))
+                    },
+                    None => Value::ChronoDate(None)
+                }
+            }).collect()
+        }
+        DataType::Date64 => {
+            let array = array.as_primitive::<datatypes::Date64Type>();
+            array.iter().map(|v| {
+                match v {
+                    Some(v) => {
+                        let date = temporal_conversions::date64_to_datetime(v).unwrap().date();
+                        Value::ChronoDate(Some(Box::new(date)))
+                    },
+                    None => Value::ChronoDate(None)
+                }
+            }).collect()
+        }
+        DataType::Time32(unit) => {
+            match unit {
+                TimeUnit::Second => {
+                    let array = array.as_primitive::<datatypes::Time32SecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let time = temporal_conversions::time32s_to_time(v).unwrap();
+                                Value::ChronoTime(Some(Box::new(time)))
+                            },
+                            None => Value::ChronoTime(None)
+                        }
+                    }).collect()
+                },
+                TimeUnit::Millisecond => {
+                    let array = array.as_primitive::<datatypes::Time32MillisecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let time = temporal_conversions::time32ms_to_time(v).unwrap();
+                                Value::ChronoTime(Some(Box::new(time)))
+                            },
+                            None => Value::ChronoTime(None)
+                        }
+                    }).collect()
+                },
+                _ => unreachable!("Time32 is always second or millisecond"),
+            }
+        }
+        DataType::Time64(unit) => {
+            match unit {
+                TimeUnit::Microsecond => {
+                    let array = array.as_primitive::<datatypes::Time64MicrosecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let time = temporal_conversions::time64us_to_time(v).unwrap();
+                                Value::ChronoTime(Some(Box::new(time)))
+                            },
+                            None => Value::ChronoTime(None)
+                        }
+                    }).collect()
+                },
+                TimeUnit::Nanosecond => {
+                    let array = array.as_primitive::<datatypes::Time64NanosecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let time = temporal_conversions::time64ns_to_time(v).unwrap();
+                                Value::ChronoTime(Some(Box::new(time)))
+                            },
+                            None => Value::ChronoTime(None)
+                        }
+                    }).collect()
+                },
+                _ => unreachable!("Time64 is always microsecond or nanosecond"),
+            }
+        }
+        DataType::Timestamp(unit, None) => {
+            match unit {
+                TimeUnit::Second => {
+                    let array = array.as_primitive::<datatypes::TimestampSecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let datetime = temporal_conversions::timestamp_s_to_datetime(v).unwrap();
+                                Value::ChronoDateTime(Some(Box::new(datetime)))
+                            },
+                            None => Value::ChronoDateTime(None)
+                        }
+                    }).collect()
+                },
+                TimeUnit::Millisecond => {
+                    let array = array.as_primitive::<datatypes::TimestampMillisecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let datetime = temporal_conversions::timestamp_ms_to_datetime(v).unwrap();
+                                Value::ChronoDateTime(Some(Box::new(datetime)))
+                            },
+                            None => Value::ChronoDateTime(None)
+                        }
+                    }).collect()
+                },
+                TimeUnit::Microsecond => {
+                    let array = array.as_primitive::<datatypes::TimestampMicrosecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let datetime = temporal_conversions::timestamp_us_to_datetime(v).unwrap();
+                                Value::ChronoDateTime(Some(Box::new(datetime)))
+                            },
+                            None => Value::ChronoDateTime(None)
+                        }
+                    }).collect()
+                },
+                TimeUnit::Nanosecond => {
+                    let array = array.as_primitive::<datatypes::TimestampNanosecondType>();
+                    array.iter().map(|v| {
+                        match v {
+                            Some(v) => {
+                                let datetime = temporal_conversions::timestamp_ns_to_datetime(v).unwrap();
+                                Value::ChronoDateTime(Some(Box::new(datetime)))
+                            },
+                            None => Value::ChronoDateTime(None)
+                        }
+                    }).collect()
+                },
+            }
         }
         // Extend with other types, e.g. to support arrays, dates, etc.
         _ => return None,
