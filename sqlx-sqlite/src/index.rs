@@ -459,20 +459,6 @@ impl SQLiteIndex {
         "#;
         sqlx::query(&query).execute(&self.pool).await?;
 
-        // The statistics columns are hardcoded in this example
-        // It would be up to you to decide if this is appropriate for your use case
-        // You could also store the statistics in a more flexible way, e.g. as a JSON blob or as an entity-attribute-value table
-        // let query = r#"
-        //     CREATE TABLE IF NOT EXISTS row_group_statistics (
-        //         file_id INTEGER NOT NULL,
-        //         row_group INTEGER NOT NULL,
-        //         row_count INTEGER NOT NULL,
-        //         PRIMARY KEY (file_id, row_group),
-        //         FOREIGN KEY (file_id) REFERENCES file_statistics(file_id)
-        //     )
-        // "#;
-        // sqlx::query(&query).execute(&self.pool).await?;
-
         let sql = Table::create()
             .table(Alias::new("file_statistics"))
             .if_not_exists()
