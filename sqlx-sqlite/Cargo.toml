@@ -1,0 +1,22 @@
+[package]
+name = "sqlx-sqlite-index-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "~1"
+async-trait = "0"
+datafusion = { features = ["backtrace"], git = "https://github.com/apache/datafusion.git" }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git" }
+datafusion-common = { git = "https://github.com/apache/datafusion.git" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git" }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git" }
+sqlx = { version = "~0", features = [ "runtime-tokio", "sqlite" ] }
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = [ "rt-multi-thread", "macros" ] }
+url = "2"
+object_store = { version = "0" }
+sea-query = { version = "0", features = ["backend-sqlite", "hashable-value", "derive", "thread-safe"] }
+sea-query-binder = { version = "0", features = ["sqlx-sqlite" ] }
